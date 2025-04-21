@@ -8,3 +8,6 @@ langchain-groq
 groq
 python-dotenv
 agno
+llama-index
+llama-index-llms-groq
+llama-index-vector-stores-mongodb
