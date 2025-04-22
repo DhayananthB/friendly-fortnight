@@ -256,23 +256,38 @@ async def get_rag_response(query: str, language: str):
     """
     Get RAG-enhanced response using LangChain
     """
-    # Template for agricultural queries
-    template = """
-    You are an agricultural expert assistant helping farmers with their questions.
-    Use the following pieces of retrieved context to answer the user's question.
-    If you don't know the answer, just say that you don't know, don't try to make up an answer.
-    
-    Context:
-    {context}
-    
-    Question: {question}
-    
-    Answer in {language} language. Provide practical and actionable advice when possible.
-    """
+    # Template for agricultural queries with stronger language instruction
+    if language.lower() == "tamil":
+        template = """
+        You are an agricultural expert assistant helping farmers with their questions.
+        Use the following pieces of retrieved context to answer the user's question.
+        If you don't know the answer, just say that you don't know, don't try to make up an answer.
+        
+        Context:
+        {context}
+        
+        Question: {question}
+        
+        IMPORTANT: Your response MUST be COMPLETELY in Tamil language only. No English words should be included.
+        Translate all agricultural terms to Tamil equivalents. Provide practical and actionable advice when possible.
+        """
+    else:
+        template = """
+        You are an agricultural expert assistant helping farmers with their questions.
+        Use the following pieces of retrieved context to answer the user's question.
+        If you don't know the answer, just say that you don't know, don't try to make up an answer.
+        
+        Context:
+        {context}
+        
+        Question: {question}
+        
+        Provide practical and actionable advice when possible.
+        """
     
     prompt = PromptTemplate(
         template=template,
-        input_variables=["context", "question", "language"]
+        input_variables=["context", "question"]
     )
     
     try:
@@ -286,22 +301,69 @@ async def get_rag_response(query: str, language: str):
         )
         
         # Get answer
-        result = qa_chain({"query": query, "language": language})
-        return result["result"]
+        result = qa_chain({"query": query})
+        response = result["result"]
+        
+        # For Tamil, add verification step to ensure complete translation
+        if language.lower() == "tamil":
+            # Double-check that the response is in Tamil by asking the model to translate it fully
+            verification_prompt = f"""
+            The following is supposed to be entirely in Tamil, but may contain some English words or phrases.
+            Please translate any remaining English words or phrases to Tamil, ensuring the entire response is in Tamil only:
+            
+            {response}
+            
+            Return the fully Tamil version only.
+            """
+            
+            verification_result = llm.invoke(verification_prompt)
+            return verification_result.content
+        
+        return response
     except Exception as e:
         logger.error(f"Error in RAG response generation: {str(e)}")
         # Fallback to direct LLM call without retrieval
         try:
-            fallback_prompt = f"""
-            You are an agricultural expert assistant helping farmers with their questions.
-            Question: {query}
-            Answer in {language} language. Provide practical and actionable advice if possible.
-            """
+            if language.lower() == "tamil":
+                fallback_prompt = f"""
+                நீங்கள் ஒரு விவசாய நிபுணர் உதவியாளராக இருந்து, விவசாயிகளின் கேள்விகளுக்கு உதவுகிறீர்கள்.
+                கேள்வி: {query}
+                
+                செயல்படக்கூடிய மற்றும் செயல்திறனான ஆலோசனைகளை வழங்கவும்.
+                """
+
+            else:
+                fallback_prompt = f"""
+                You are an agricultural expert assistant helping farmers with their questions.
+                Question: {query}
+                
+                Provide practical and actionable advice if possible.
+                """
+            
             response = llm.invoke(fallback_prompt)
-            return response.content
+            result = response.content
+            
+            # For Tamil, verify the response is completely in Tamil
+            if language.lower() == "tamil":
+                verification_prompt = f"""
+                The following is supposed to be entirely in Tamil, but may contain some English words or phrases.
+                Please translate any remaining English words or phrases to Tamil, ensuring the entire response is in Tamil only:
+                
+                {result}
+                
+                Return the fully Tamil version only be natural dont add statements like -> Here is the fully Tamil version:.
+                """
+                
+                verification_result = llm.invoke(verification_prompt)
+                return verification_result.content
+            
+            return result
         except Exception as fallback_error:
             logger.error(f"Fallback response also failed: {str(fallback_error)}")
-            return f"I apologize, but I'm having trouble generating a response at the moment. Please try again later."
+            if language.lower() == "tamil":
+                return "மன்னிக்கவும், தற்போது பதிலளிப்பதில் சிக்கல் ஏற்பட்டுள்ளது. தயவுசெய்து பின்னர் மீண்டும் முயற்சிக்கவும்."
+            else:
+                return "I apologize, but I'm having trouble generating a response at the moment. Please try again later."
 
 # API Endpoints
 @app.post("/chat", response_model=ChatResponse)
