@@ -1,13 +1,43 @@
+# fastapi
+# uvicorn
+# pydantic
+# langchain
+# langchain_community
+# langchain-core
+# langchain-groq
+# groq
+# python-dotenv
+# agno
+# llama-index
+# llama-index-llms-groq
+# llama-index-vector-stores-mongodb
+
+# API and Web Framework
 fastapi
 uvicorn
+python-multipart
 pydantic
-langchain
-langchain_community
-langchain-core
-langchain-groq
-groq
 python-dotenv
-agno
-llama-index
-llama-index-llms-groq
-llama-index-vector-stores-mongodb
+
+# Database
+motor
+pymongo
+
+# LLM and RAG components
+groq
+langchain
+langchain-community
+langchain-groq
+langchain-mongodb
+langchain-google-genai  # Added this package for Google Generative AI embeddings
+google-generativeai
+
+# Document Processing
+pypdf
+beautifulsoup4
+requests
+
+# Utilities
+python-jose  # For JWT tokens if needed
+httpx  # For async HTTP requests
+tenacity  # For retries

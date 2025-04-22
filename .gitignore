@@ -26,6 +26,8 @@ venv/
 env/
 ENV/
 
+test/
+
 # Conda Environment
 conda-env/
 .conda/
