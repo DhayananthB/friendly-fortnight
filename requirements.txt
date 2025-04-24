@@ -52,3 +52,5 @@ apscheduler
 jsonpath-ng
 lxml  # Required for pd.read_html
 html5lib  
+pandas
+numpy
