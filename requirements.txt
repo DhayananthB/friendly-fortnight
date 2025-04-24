@@ -47,3 +47,8 @@ pinecone-notebooks
 pinecone
 
 google-genai 
+apscheduler
+
+jsonpath-ng
+lxml  # Required for pd.read_html
+html5lib  

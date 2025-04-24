@@ -23,6 +23,13 @@ from langchain_mongodb import MongoDBAtlasVectorSearch
 import google.generativeai as genai
 import logging
 from contextlib import asynccontextmanager
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from io import StringIO
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from pymongo import DeleteMany
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +44,9 @@ async def lifespan(app: FastAPI):
     """
     Lifespan event handler that runs on startup and shutdown
     """
+    # Create scheduler
+    scheduler = AsyncIOScheduler()
+    
     # Startup logic
     try:
         # Create indexes if they don't exist
@@ -46,6 +56,40 @@ async def lifespan(app: FastAPI):
         global vector_store
         vector_store = await init_vector_store()
         
+        # Create index for websites collection
+        await websites_collection.create_index("url", unique=True)
+        
+        # Schedule daily scraping at 1 AM
+        scheduler.add_job(
+            run_scheduled_scraping,
+            CronTrigger(hour=1, minute=0),  # Run at 1:00 AM every day
+            id="daily_scraping"
+        )
+        
+        # Start the scheduler
+        scheduler.start()
+        logger.info("Scheduled tasks initialized")
+        
+        # Add the fertilizer website if it doesn't exist
+        default_website = {
+            "url": "http://115.243.209.84/ARS/fert_stock_position/index/en",
+            "title": "Fertilizer Stock Position",
+            "description": "Current fertilizer stock data from government portal",
+            "scrape_type": "table",
+            "active": True,
+            "created_at": datetime.now()
+        }
+        
+        await websites_collection.update_one(
+            {"url": default_website["url"]},
+            {"$set": default_website},
+            upsert=True
+        )
+        
+        # Initial scraping of all websites
+        background_tasks = BackgroundTasks()
+        background_tasks.add_task(run_scheduled_scraping)
+        
         logger.info("Application started successfully")
     except Exception as e:
         logger.error(f"Error during startup: {str(e)}")
@@ -54,7 +98,9 @@ async def lifespan(app: FastAPI):
     
     yield  # This is where the application runs
     
-    # Shutdown logic (if needed)
+    # Shutdown logic
+    if scheduler.running:
+        scheduler.shutdown()
     logger.info("Application shutting down")
 
 # Initialize MongoDB client
@@ -66,6 +112,7 @@ db = client.agricultural_chatbot
 chat_collection = db.chat_histories
 vector_collection = db.vector_embeddings
 user_preferences = db.user_preferences
+websites_collection = db.websites_to_scrape
 
 # Initialize FastAPI app with lifespan
 app = FastAPI(
@@ -192,6 +239,17 @@ class ChatHistory(BaseModel):
     chat_id: str
     language: str
     messages: List[Message]
+
+class ScrapableWebsite(BaseModel):
+    url: HttpUrl
+    title: str
+    description: Optional[str] = None
+    scrape_type: str = "auto"  # "auto", "table", "json", "text", "custom"
+    selector: Optional[str] = None  # CSS selector for finding the element to scrape
+    json_path: Optional[str] = None  # JSONPath expression for JSON data extraction
+    headers: Optional[Dict[str, str]] = None  # Custom headers for the request
+    active: bool = True
+    last_scraped: Optional[datetime] = None
 
 # Helper Functions
 async def get_language_preference(user_id: str) -> str:
@@ -415,6 +473,330 @@ async def get_rag_response(query: str, language: str):
             else:
                 return "I apologize, but I'm having trouble generating a response at the moment. Please try again later."
 
+async def scrape_website(website: Dict[str, Any]):
+    """
+    Scrape data from a website based on its scrape_type
+    """
+    try:
+        url = website["url"]
+        title = website["title"]
+        scrape_type = website.get("scrape_type", "auto")
+        
+        # If scrape_type is auto, try to detect the content type
+        if scrape_type == "auto":
+            scrape_type = await detect_content_type(url, website.get("headers"))
+        
+        # Call appropriate scraper based on type
+        if scrape_type == "json":
+            return await scrape_json_from_website(website)
+        elif scrape_type == "table":
+            return await scrape_table_from_website(website)
+        elif scrape_type == "text":
+            return await scrape_text_from_website(website)
+        else:
+            logger.error(f"Unsupported scrape type: {scrape_type} for {url}")
+            return False
+    except Exception as e:
+        logger.error(f"Error determining scrape type for {website['url']}: {str(e)}")
+        return False
+
+async def detect_content_type(url: str, headers: Optional[Dict[str, str]] = None):
+    """
+    Detect the content type of a URL (JSON or HTML with tables)
+    """
+    try:
+        # Use custom headers if provided
+        headers = headers or {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        
+        # Send a HEAD request first to check content type
+        head_response = requests.head(url, headers=headers)
+        content_type = head_response.headers.get('Content-Type', '').lower()
+        
+        if 'application/json' in content_type:
+            return "json"
+        
+        # If not json by header, try to fetch and analyze
+        response = requests.get(url, headers=headers)
+        
+        # Check if it begins with JSON structure
+        text = response.text.strip()
+        if text.startswith('{') and text.endswith('}') or text.startswith('[') and text.endswith(']'):
+            try:
+                json.loads(text)
+                return "json"
+            except json.JSONDecodeError:
+                pass
+        
+        # Check for tables in HTML
+        soup = BeautifulSoup(response.text, 'html.parser')
+        tables = soup.find_all('table')
+        if tables:
+            return "table"
+        
+        # Default to text if no other format detected
+        return "text"
+    except Exception as e:
+        logger.error(f"Error detecting content type: {str(e)}")
+        # Default to table as fallback
+        return "table"
+
+async def scrape_json_from_website(website: Dict[str, Any]):
+    """
+    Scrape JSON data from a website API endpoint
+    """
+    try:
+        import jsonpath_ng
+        from jsonpath_ng import parse
+        
+        url = website["url"]
+        title = website["title"]
+        json_path = website.get("json_path")
+        headers = website.get("headers", {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        
+        # Send GET request
+        response = requests.get(url, headers=headers)
+        
+        # Try to parse JSON
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch JSON from {url}: Status code {response.status_code}")
+            return False
+        
+        json_data = response.json()
+        
+        # Extract specific data if json_path is provided
+        if json_path:
+            jsonpath_expr = parse(json_path)
+            matches = [match.value for match in jsonpath_expr.find(json_data)]
+            # Use extracted data if found, otherwise use full JSON
+            if matches:
+                data_to_store = matches
+            else:
+                data_to_store = json_data
+        else:
+            data_to_store = json_data
+        
+        # Convert to string representation
+        if isinstance(data_to_store, list) and len(data_to_store) > 0:
+            # If it's a list of objects, try to convert to DataFrame then CSV
+            try:
+                df = pd.DataFrame(data_to_store)
+                data_string = df.to_csv(index=False)
+                data_type = "tabular_json"
+            except Exception:
+                data_string = json.dumps(data_to_store, indent=2)
+                data_type = "json"
+        else:
+            # Otherwise just pretty-print the JSON
+            data_string = json.dumps(data_to_store, indent=2)
+            data_type = "json"
+        
+        # Create document for vector store
+        document = Document(
+            page_content=f"{title} Data:\n{data_string}",
+            metadata={
+                "source": url,
+                "title": title,
+                "type": "scraped_data",
+                "format": data_type,
+                "timestamp": datetime.now().isoformat(),
+                "description": website.get("description", "Scraped JSON data")
+            }
+        )
+        
+        # Delete previous versions of this data
+        await vector_collection.delete_many({
+            "metadata.source": url,
+            "metadata.type": "scraped_data"
+        })
+        
+        # Split if necessary
+        chunks = text_splitter.split_documents([document])
+        
+        # Store embeddings
+        await store_document_embeddings(chunks)
+        
+        # Update last scraped timestamp
+        await websites_collection.update_one(
+            {"url": url},
+            {"$set": {"last_scraped": datetime.now()}}
+        )
+        
+        logger.info(f"Successfully scraped and stored JSON data from: {url}")
+        return True
+    except Exception as e:
+        logger.error(f"Error scraping JSON data from {website['url']}: {str(e)}")
+        return False
+
+async def scrape_table_from_website(website: Dict[str, Any]):
+    """
+    Scrape table data from a website and store it in the knowledge base
+    """
+    try:
+        url = website["url"]
+        title = website["title"]
+        selector = website.get("selector")
+        headers = website.get("headers", {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        
+        # Send GET request
+        response = requests.get(url, headers=headers)
+        response.encoding = 'utf-8'  # Ensure proper character decoding
+        
+        # Parse HTML content
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Find the table - use selector if provided, otherwise find first table
+        if selector:
+            table = soup.select_one(selector)
+        else:
+            table = soup.find('table')
+        
+        if not table:
+            logger.error(f"No table found on the page: {url}")
+            return False
+            
+        # Use pandas to read the HTML table
+        df_list = pd.read_html(str(table))
+        if not df_list:
+            logger.error(f"Could not parse table data from: {url}")
+            return False
+            
+        df = df_list[0]
+        
+        # Convert to string and add metadata
+        csv_string = df.to_csv(index=False)
+        
+        # Create document for vector store
+        document = Document(
+            page_content=f"{title} Data:\n{csv_string}",
+            metadata={
+                "source": url,
+                "title": title,
+                "type": "scraped_data",
+                "format": "table",
+                "timestamp": datetime.now().isoformat(),
+                "description": website.get("description", "Scraped tabular data")
+            }
+        )
+        
+        # Delete previous versions of this data
+        await vector_collection.delete_many({
+            "metadata.source": url,
+            "metadata.type": "scraped_data"
+        })
+        
+        # Split if necessary
+        chunks = text_splitter.split_documents([document])
+        
+        # Store embeddings
+        await store_document_embeddings(chunks)
+        
+        # Update last scraped timestamp
+        await websites_collection.update_one(
+            {"url": url},
+            {"$set": {"last_scraped": datetime.now()}}
+        )
+        
+        logger.info(f"Successfully scraped and stored table data from: {url}")
+        return True
+    except Exception as e:
+        logger.error(f"Error scraping table data from {url}: {str(e)}")
+        return False
+
+async def scrape_text_from_website(website: Dict[str, Any]):
+    """
+    Scrape text content from a website
+    """
+    try:
+        url = website["url"]
+        title = website["title"]
+        selector = website.get("selector")
+        headers = website.get("headers", {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        
+        # Send GET request
+        response = requests.get(url, headers=headers)
+        response.encoding = 'utf-8'
+        
+        # Parse HTML content
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Remove script and style elements
+        for script in soup(["script", "style"]):
+            script.extract()
+        
+        # Get text content
+        if selector:
+            elements = soup.select(selector)
+            if not elements:
+                logger.error(f"No elements found with selector '{selector}' on {url}")
+                return False
+            
+            text_content = "\n".join(element.get_text(strip=True) for element in elements)
+        else:
+            # Get main content or fallback to body
+            main = soup.find('main') or soup.find('article') or soup.find('body')
+            text_content = main.get_text(separator="\n", strip=True)
+        
+        if not text_content.strip():
+            logger.error(f"No text content extracted from {url}")
+            return False
+        
+        # Create document for vector store
+        document = Document(
+            page_content=f"{title}:\n{text_content}",
+            metadata={
+                "source": url,
+                "title": title,
+                "type": "scraped_data",
+                "format": "text",
+                "timestamp": datetime.now().isoformat(),
+                "description": website.get("description", "Scraped text content")
+            }
+        )
+        
+        # Delete previous versions
+        await vector_collection.delete_many({
+            "metadata.source": url,
+            "metadata.type": "scraped_data"
+        })
+        
+        # Split document into chunks
+        chunks = text_splitter.split_documents([document])
+        
+        # Store embeddings
+        await store_document_embeddings(chunks)
+        
+        # Update last scraped timestamp
+        await websites_collection.update_one(
+            {"url": url},
+            {"$set": {"last_scraped": datetime.now()}}
+        )
+        
+        logger.info(f"Successfully scraped and stored text from: {url}")
+        return True
+    except Exception as e:
+        logger.error(f"Error scraping text from {url}: {str(e)}")
+        return False
+
+async def run_scheduled_scraping():
+    """
+    Run scraping for all active websites in the database
+    """
+    websites = await websites_collection.find({"active": True}).to_list(length=100)
+    logger.info(f"Running scheduled scraping for {len(websites)} websites")
+    
+    for website in websites:
+        await scrape_website(website)
+        
+    logger.info("Scheduled scraping completed")
+
 # API Endpoints
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(chat_request: ChatRequest):
@@ -579,6 +961,59 @@ async def health_check():
     Health check endpoint to verify the API is running
     """
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+@app.post("/websites/add", response_model=ScrapableWebsite)
+async def add_website_to_scrape(website: ScrapableWebsite):
+    """
+    Add a website to the list of websites to scrape regularly
+    """
+    # Convert the model to a dictionary
+    website_dict = website.model_dump()
+    
+    # Add creation timestamp
+    website_dict["created_at"] = datetime.now()
+    
+    # Insert into collection
+    await websites_collection.update_one(
+        {"url": str(website.url)},
+        {"$set": website_dict},
+        upsert=True
+    )
+    
+    # Return the created website
+    return website
+
+@app.get("/websites/list", response_model=List[ScrapableWebsite])
+async def list_websites_to_scrape():
+    """
+    List all websites registered for scraping
+    """
+    websites = await websites_collection.find().to_list(length=100)
+    return websites
+
+@app.post("/websites/scrape-now/{website_id}")
+async def scrape_website_now(website_id: str, background_tasks: BackgroundTasks):
+    """
+    Manually trigger scraping for a specific website
+    """
+    from bson.objectid import ObjectId
+    
+    website = await websites_collection.find_one({"_id": ObjectId(website_id)})
+    if not website:
+        raise HTTPException(status_code=404, detail="Website not found")
+    
+    # Process in background
+    background_tasks.add_task(scrape_website, website)
+    
+    return {"status": "processing", "website": website["url"]}
+
+@app.post("/websites/scrape-all-now")
+async def scrape_all_websites_now(background_tasks: BackgroundTasks):
+    """
+    Manually trigger scraping for all active websites
+    """
+    background_tasks.add_task(run_scheduled_scraping)
+    return {"status": "processing"}
 
 # Main function
 if __name__ == "__main__":
