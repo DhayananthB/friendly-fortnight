@@ -127,7 +127,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=GOOGLE_API_KEY)
 
 # Initialize embeddings
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
 
 # Initialize text splitter
 text_splitter = RecursiveCharacterTextSplitter(
@@ -226,7 +226,7 @@ async def add_default_websites():
 # Initialize LLM
 llm = ChatGroq(
     temperature=0.2,
-    model_name="llama3-70b-8192",
+    model_name="deepseek-r1-distill-llama-70b",
     groq_api_key=GROQ_API_KEY,
 )
 
