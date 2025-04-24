@@ -41,3 +41,9 @@ requests
 python-jose  # For JWT tokens if needed
 httpx  # For async HTTP requests
 tenacity  # For retries
+
+langchain-pinecone 
+pinecone-notebooks
+pinecone
+
+google-genai 

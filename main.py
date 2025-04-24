@@ -41,6 +41,11 @@ async def lifespan(app: FastAPI):
     try:
         # Create indexes if they don't exist
         await chat_collection.create_index("chat_id", unique=True)
+        
+        # Initialize vector store during startup
+        global vector_store
+        vector_store = await init_vector_store()
+        
         logger.info("Application started successfully")
     except Exception as e:
         logger.error(f"Error during startup: {str(e)}")
@@ -88,7 +93,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=GOOGLE_API_KEY)
 
 # Initialize embeddings
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-004")
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 
 # Initialize text splitter
 text_splitter = RecursiveCharacterTextSplitter(
@@ -96,12 +101,55 @@ text_splitter = RecursiveCharacterTextSplitter(
     chunk_overlap=200,
 )
 
-# Initialize vector store
-vector_store = MongoDBAtlasVectorSearch(
-    collection=vector_collection,
-    embedding=embeddings,
-    index_name="vector_index",
-)
+# Initialize vector store - this will be properly initialized in the lifespan startup
+vector_store = None
+
+# Function to initialize vector store
+async def init_vector_store():
+    """
+    Initialize and return the MongoDB Atlas Vector Search store
+    """
+    # Ensure the collection exists
+    collection_names = await db.list_collection_names()
+    if vector_collection.name not in collection_names:
+        await db.create_collection(vector_collection.name)
+    
+    # Initialize vector store with a properly wrapped collection to handle async operations
+    import asyncio
+    from pymongo.collection import Collection
+    
+    # Patch the collection to avoid the RuntimeWarning
+    # This removes the async list_collection_names and create_collection calls from inside MongoDBAtlasVectorSearch
+    class SyncCollection(Collection):
+        def __init__(self, async_collection):
+            self._async_collection = async_collection
+            super().__init__(
+                async_collection.database.delegate, 
+                async_collection.name,
+                create=False
+            )
+    
+    sync_collection = SyncCollection(vector_collection)
+    
+    store = MongoDBAtlasVectorSearch(
+        collection=sync_collection,
+        embedding=embeddings,
+        index_name="vector_index",
+        relevance_score_fn="cosine",
+    )
+    
+    # Create vector search index - handle creation in async-aware way
+    try:
+        # MongoDB Atlas Vector Search doesn't have a specific async method for creating index
+        # Create the index synchronously but handle it properly in async context
+        await asyncio.to_thread(
+            lambda: store.create_vector_search_index(dimensions=768)
+        )
+        logger.info("Vector search index created or updated successfully")
+    except Exception as e:
+        logger.warning(f"Vector search index might already exist: {str(e)}")
+    
+    return store
 
 # Initialize LLM
 llm = ChatGroq(
@@ -249,7 +297,9 @@ async def store_document_embeddings(documents: List[Document]):
     """
     Store document embeddings in MongoDB Atlas Vector Search
     """
-    vector_store.add_documents(documents)
+    # Use asyncio to run the synchronous add_documents method in a thread pool
+    import asyncio
+    await asyncio.to_thread(lambda: vector_store.add_documents(documents))
     logger.info(f"Stored {len(documents)} document chunks in vector store")
 
 async def get_rag_response(query: str, language: str):
