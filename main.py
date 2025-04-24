@@ -70,21 +70,8 @@ async def lifespan(app: FastAPI):
         scheduler.start()
         logger.info("Scheduled tasks initialized")
         
-        # Add the fertilizer website if it doesn't exist
-        default_website = {
-            "url": "http://115.243.209.84/ARS/fert_stock_position/index/en",
-            "title": "Fertilizer Stock Position",
-            "description": "Current fertilizer stock data from government portal",
-            "scrape_type": "table",
-            "active": True,
-            "created_at": datetime.now()
-        }
-        
-        await websites_collection.update_one(
-            {"url": default_website["url"]},
-            {"$set": default_website},
-            upsert=True
-        )
+        # Add default websites
+        await add_default_websites()
         
         # Initial scraping of all websites
         background_tasks = BackgroundTasks()
@@ -197,6 +184,44 @@ async def init_vector_store():
         logger.warning(f"Vector search index might already exist: {str(e)}")
     
     return store
+
+# Function to add default websites
+async def add_default_websites():
+    """
+    Add default websites to the scraping system
+    """
+    default_websites = [
+        {
+            "url": "http://115.243.209.84/ARS/fert_stock_position/index/en",
+            "title": "Fertilizer Stock Position - English",
+            "description": "Current fertilizer stock data from government portal (English version)",
+            "scrape_type": "table",
+            "active": True,
+            "created_at": datetime.now()
+        },
+        {
+            "url": "http://115.243.209.84/ARS/fert_stock_position/index/tn",
+            "title": "Fertilizer Stock Position - Tamil",
+            "description": "Current fertilizer stock data from government portal (Tamil version)",
+            "scrape_type": "table",
+            "active": True,
+            "created_at": datetime.now()
+        }
+    ]
+    
+    # Insert all default websites with upsert to avoid duplicates
+    for website in default_websites:
+        try:
+            await websites_collection.update_one(
+                {"url": website["url"]},
+                {"$set": website},
+                upsert=True
+            )
+            logger.info(f"Default website added or updated: {website['title']}")
+        except Exception as e:
+            logger.error(f"Error adding default website {website['url']}: {str(e)}")
+    
+    logger.info(f"Added {len(default_websites)} default websites")
 
 # Initialize LLM
 llm = ChatGroq(
@@ -953,6 +978,67 @@ async def list_chat_histories():
             )
         )
     return histories
+
+@app.get("/websites/suggested")
+async def get_suggested_websites():
+    """
+    Get a list of suggested agricultural websites that could be added to the system
+    """
+    suggested_websites = [
+        {
+            "url": "http://115.243.209.84/ARS/fert_stock_position/index/tn",
+            "title": "Fertilizer Stock Position - Tamil",
+            "description": "Current fertilizer stock data from government portal (Tamil version)",
+            "scrape_type": "table"
+        },
+        {
+            "url": "http://115.243.209.84/ARS/fert_stock_position/index/en",
+            "title": "Fertilizer Stock Position - English",
+            "description": "Current fertilizer stock data from government portal (English version)",
+            "scrape_type": "table"
+        },
+        {
+            "url": "https://agmarknet.gov.in/PriceAndArrivals/arrivals1.aspx",
+            "title": "Agricultural Market Prices",
+            "description": "Current market prices of agricultural commodities across India",
+            "scrape_type": "table"
+        },
+        {
+            "url": "https://www.meteoblue.com/en/weather/week/chennai_india_1264527",
+            "title": "Chennai Weather Forecast",
+            "description": "Weather forecast for Chennai region",
+            "scrape_type": "text",
+            "selector": "div.tab-content"
+        },
+        {
+            "url": "https://tnau.ac.in/crop-advisory/",
+            "title": "TNAU Crop Advisory",
+            "description": "Crop advisories from Tamil Nadu Agricultural University",
+            "scrape_type": "text",
+            "selector": "div.vc_column-inner"
+        },
+        {
+            "url": "https://farmer.gov.in/stl/stlsearch.aspx",
+            "title": "Soil Testing Labs",
+            "description": "Information about soil testing laboratories in India",
+            "scrape_type": "table"
+        },
+        {
+            "url": "https://enam.gov.in/web/dashboard/trade-data",
+            "title": "e-NAM Trade Data",
+            "description": "Electronic National Agriculture Market trade data",
+            "scrape_type": "table"
+        },
+        {
+            "url": "https://pmkisan.gov.in/",
+            "title": "PM-KISAN Scheme",
+            "description": "Information about the PM-KISAN scheme for farmers",
+            "scrape_type": "text",
+            "selector": "div.content"
+        }
+    ]
+    
+    return suggested_websites
 
 # Add a health check endpoint
 @app.get("/health")
