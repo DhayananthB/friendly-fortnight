@@ -206,6 +206,15 @@ async def add_default_websites():
             "scrape_type": "table",
             "active": True,
             "created_at": datetime.now()
+        },
+        {
+            "url": "https://api.data.gov.in/resource/35985678-0d79-46b4-9ed6-6f13308a1d24?api-key=579b464db66ec23bdd00000191d3d42d41ce4da050aa2b5c39d8b57a&format=json&limit=1000&filters%5BState%5D=Tamil%20Nadu&filters%5BArrival_Date%5D=23%2F04%2F2025",
+            "title": "Tamil Nadu Agricultural Market Prices - Taminadu",
+            "description": "Variety-wise daily market prices data of agricultural commodities in Coimbatore, Tamil Nadu",
+            "scrape_type": "json",
+            "json_path": "$.records",  # Extract just the records array from the JSON response
+            "active": True,
+            "created_at": datetime.now()
         }
     ]
     
@@ -424,6 +433,9 @@ async def get_rag_response(query: str, language: str):
     )
     
     try:
+        original_query = query
+        
+        # First attempt: Direct retrieval in the original language
         # Create retrieval chain
         qa_chain = RetrievalQA.from_chain_type(
             llm=llm,
@@ -435,7 +447,68 @@ async def get_rag_response(query: str, language: str):
         
         # Get answer
         result = qa_chain({"query": query})
-        response = result["result"]
+        
+        # Check if we got a meaningful response or if we need to try cross-language retrieval
+        if language.lower() == "tamil" and (
+            "I don't know" in result["result"] or 
+            "don't have enough information" in result["result"] or
+            len(result["source_documents"]) == 0
+        ):
+            logger.info("No good results in Tamil, attempting cross-language retrieval")
+            
+            # Translate the query to English for better matching with English content
+            english_query = await translate_text(original_query, "english")
+            logger.info(f"Translated query from Tamil to English: {english_query}")
+            
+            # Create a new English template that will later be translated back to Tamil
+            english_template = """
+            You are an agricultural expert assistant helping farmers with their questions.
+            Use the following pieces of retrieved context to answer the user's question.
+            If you don't know the answer, just say that you don't know, don't try to make up an answer.
+            
+            Context:
+            {context}
+            
+            Question: {question}
+            
+            Provide practical and actionable advice when possible.
+            """
+            
+            english_prompt = PromptTemplate(
+                template=english_template,
+                input_variables=["context", "question"]
+            )
+            
+            # Create English retrieval chain
+            english_qa_chain = RetrievalQA.from_chain_type(
+                llm=llm,
+                chain_type="stuff",
+                retriever=vector_store.as_retriever(search_kwargs={"k": 3}),
+                chain_type_kwargs={"prompt": english_prompt},
+                return_source_documents=True
+            )
+            
+            # Get answer in English
+            english_result = english_qa_chain({"query": english_query})
+            
+            if "I don't know" not in english_result["result"] and len(english_result["source_documents"]) > 0:
+                # We found relevant content in English, translate it back to Tamil
+                logger.info("Found relevant English content, translating back to Tamil")
+                
+                # Use Gemini for high-quality Tamil translation
+                tamil_translation_prompt = f"""
+                Translate the following agricultural information completely to Tamil.
+                Ensure all technical terms are properly translated and the response sounds natural in Tamil:
+                
+                {english_result["result"]}
+                """
+                
+                response = genai.GenerativeModel('gemini-pro').generate_content(tamil_translation_prompt)
+                result["result"] = response.text
+                logger.info("Successfully performed cross-language retrieval and translation")
+            else:
+                # Fall back to original Tamil result if English didn't help either
+                logger.info("Cross-language retrieval didn't yield better results, using original")
         
         # For Tamil, add verification step to ensure complete translation
         if language.lower() == "tamil":
@@ -444,7 +517,7 @@ async def get_rag_response(query: str, language: str):
             The following is supposed to be entirely in Tamil, but may contain some English words or phrases.
             Please translate any remaining English words or phrases to Tamil, ensuring the entire response is in Tamil only:
             
-            {response}
+            {result["result"]}
             
             Return the fully Tamil version only.
             """
@@ -452,7 +525,7 @@ async def get_rag_response(query: str, language: str):
             verification_result = llm.invoke(verification_prompt)
             return verification_result.content
         
-        return response
+        return result["result"]
     except Exception as e:
         logger.error(f"Error in RAG response generation: {str(e)}")
         # Fallback to direct LLM call without retrieval
@@ -996,6 +1069,13 @@ async def get_suggested_websites():
             "title": "Fertilizer Stock Position - English",
             "description": "Current fertilizer stock data from government portal (English version)",
             "scrape_type": "table"
+        },
+        {
+            "url": "https://api.data.gov.in/resource/35985678-0d79-46b4-9ed6-6f13308a1d24?api-key=579b464db66ec23bdd000001cdd3946e44ce4aad7209ff7b23ac571b&format=json&offset=20&limit=1000&filters%5BState%5D=Tamil%20Nadu&filters%5BDistrict%5D=Coimbatore",
+            "title": "Tamil Nadu Agricultural Market Prices - Coimbatore",
+            "description": "Variety-wise daily market prices data of agricultural commodities in Coimbatore, Tamil Nadu",
+            "scrape_type": "json",
+            "json_path": "$.records"
         },
         {
             "url": "https://agmarknet.gov.in/PriceAndArrivals/arrivals1.aspx",
