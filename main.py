@@ -226,7 +226,7 @@ async def add_default_websites():
 # Initialize LLM
 llm = ChatGroq(
     temperature=0.2,
-    model_name="deepseek-r1-distill-llama-70b",
+    model_name="llama3-70b-8192",
     groq_api_key=GROQ_API_KEY,
 )
 
